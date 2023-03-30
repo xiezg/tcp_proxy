@@ -288,7 +288,7 @@ class TCPProxy(threading.Thread):
     #通过设置 EPOLLONESHOT 来避免上述问题
     def event_loop( self):
         while True:
-           events = self.epoll.poll(1)
+           events = self.epoll.poll(0)
            for fileno, event in events:
               logger.debug( "recv fd:{} event: {:#06x} {}".format( fileno, event, self.__event_name(event) ) )
               if fileno == self.listen_socket.fileno():
