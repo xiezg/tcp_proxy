@@ -21,3 +21,17 @@ tcp转发 监听端口 7777，并将tcp流量转发到 target_addr:target_port
 1. 多次调用epoll_ctl注册不同的事件，会导致覆盖之前注册的事件。
 #### Q7、 epoll框架下的sockt send
 1. 当socket设置为非阻塞模式，没有必要在通过设置EPOLLOUT来触发后，才进行send操作。可以直接操作send，不过也要根据具体业务来进行调整。
+
+# 测试
+1. 开启一个echo server
+```
+socat TCP4-LISTEN:9999,fork EXEC:cat
+```
+2. 启动tcp_proyx
+```
+python3 tcp_proxy.py
+```
+3. 开启客户端
+```
+telnet x.x.x.x 7777
+```
