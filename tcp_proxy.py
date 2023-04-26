@@ -1,6 +1,7 @@
-###
-### URL: https://github.com/xiezg/tcp_proxy
-###
+####    python 3.8.16
+####    URL: https://github.com/xiezg/tcp_proxy
+
+from abc import ABC, abstractmethod
 import time
 import threading
 import sys
@@ -10,7 +11,6 @@ import socket, select
 import logging
 import traceback
 
-logging.basicConfig(level = logging.DEBUG, format = '%(asctime)s %(threadName)-9s line:%(lineno)-4d %(levelname)7s %(funcName)16s():%(message)s')
 logger = logging.getLogger(__name__)
 
 MYSQL_CONN_PENDING   = 0      #接收到客户端的连接请求并就绪后，连接到mysql的请求连接还未就绪,这时只可以从clinet接收数据，但是不可以向数据库发送数据
@@ -29,13 +29,16 @@ class MySocket:
         self.recv_buf = bytearray()
 
     def shutdown(self, flag):
-        self.__socket.shutdown( flag )
+        try:
+            self.__socket.shutdown( flag )
+        except socket.error as e:
+            if e.errno == errno.ENOTCONN:   #发生这个异常的原因：1、当对端已经关闭 2、重复调用
+                logger.warning( "fd[{}] shutdown exception:[{}]".format( self.__socket.fileno(), e ) )
+                return
+            raise e
 
     def close(self):
         self.__socket.close()
-
-    def getpeername( self):
-        return self.__socket.getpeername()
 
     def connect(self, address):
         return self.__socket.connect( address)
@@ -47,10 +50,7 @@ class MySocket:
         return self.__socket.fileno()
 
     def enable_epoll_read(self):
-        try:
-            self.__epoll.modify( self.fileno(), select.EPOLLIN|MY_EPOLL_FLAGS)
-        except FileNotFoundError as e:
-            logger.error( e )
+        self.__epoll.modify( self.fileno(), select.EPOLLIN|MY_EPOLL_FLAGS) 
 
     def send(self, data ):
         try:
@@ -71,6 +71,8 @@ class MySocket:
             logger.error(e)
             if e.errno == errno.EBADF:
                 raise ConnShutDown
+            if e.errno == errno.ENOTCONN:
+                raise ConnShutDown
             raise e
         except socket.error as e:
             logger.error("send fd[{}], err:[{}]".format(self.__fd, e) )
@@ -80,7 +82,7 @@ class MySocket:
         try:
             data = self.__socket.recv(size)
             if len( data ) == 0:
-                logger.info( "recv empty, peer close fd:[{}] local/peer:[{}/{}]".format( self.__socket.fileno(), self.__socket.getsockname(), self.__socket.getpeername() ) )
+                logger.warning( "recv empty, peer close fd:[{}]".format( self.__socket.fileno() ) )
                 raise ConnShutDown
             return data
         except BlockingIOError as e:
@@ -95,6 +97,8 @@ class MySocket:
         except OSError as e:
             logger.error(e)
             if e.errno == errno.EBADF:
+                raise ConnShutDown
+            if e.errno == errno.ENOTCONN:
                 raise ConnShutDown
             raise e
         except socket.error as e:
@@ -129,14 +133,16 @@ def epoll_read_event( src, dst ):
     except BlockingIOError as e:
         src.enable_epoll_read()
 
+#socket读事件总是开启，写事件选择性开启
 class conn_pair:
 
     def __init__( self, client_socket, mysqld_socket ):
-        self.client_socket = client_socket #客户端
-        self.mysqld_socket = mysqld_socket #目的端
+        #记录下文件号，方便删除
+        self.client_socket = client_socket
+        self.mysqld_socket = mysqld_socket
         self.__close_lock = threading.Lock()
-
-        self.status = MYSQL_CONN_PENDING
+        self.__ref_count = 2
+        self.status = MYSQL_CONN_PENDING    ##没有加锁保护
 
     def epoll_in( self, fd):
         if self.client_socket != None and fd == self.client_socket.fileno():
@@ -158,21 +164,42 @@ class conn_pair:
 
     def clean(self, fd ):
         with self.__close_lock:
-            if self.client_socket != None and fd == self.client_socket.fileno():
-                logger.info( "close client fd:[{}] connect".format( self.client_socket.fileno()) )
+
+            self.__ref_count = self.__ref_count - 1
+
+            if self.__ref_count == 1:
+                self.client_socket.shutdown(socket.SHUT_RDWR)
+                self.mysqld_socket.shutdown(socket.SHUT_RDWR)
+                logger.debug( "shutdown client_socket:[{}] mysqld_socket:[{}]".format(\
+                        self.client_socket.fileno(), \
+                        self.mysqld_socket.fileno() ))
+                return
+
+            if self.__ref_count == 0:
                 self.client_socket.close()
                 self.client_socket = None
-                self.mysqld_socket != None and self.mysqld_socket.shutdown(socket.SHUT_RDWR)
-                return
-
-            if self.mysqld_socket != None and fd == self.mysqld_socket.fileno():
-                logger.info( "close mysqld fd:[{}] connect".format( self.mysqld_socket.fileno()) )
                 self.mysqld_socket.close()
                 self.mysqld_socket = None
-                self.client_socket!= None and self.client_socket.shutdown(socket.SHUT_RDWR)
+                logger.debug( "close client_socket and mysqld_socket" )
                 return
 
-            raise Exception( "invalid fd: {}".format( fd ) )
+            raise Exception( "invalid refcount:[{}]".format( self.__ref_count) )
+
+            #if self.client_socket != None and fd == self.client_socket.fileno():
+            #    logger.info( "close client fd:[{}] connect".format( self.client_socket.fileno()) )
+            #    self.client_socket.close()
+            #    self.client_socket = None
+            #    self.mysqld_socket != None and self.mysqld_socket.shutdown(socket.SHUT_RDWR)
+            #    return
+
+            #if self.mysqld_socket != None and fd == self.mysqld_socket.fileno():
+            #    logger.info( "close mysqld fd:[{}] connect".format( self.mysqld_socket.fileno()) )
+            #    self.mysqld_socket.close()
+            #    self.mysqld_socket = None
+            #    self.client_socket != None and self.client_socket.shutdown(socket.SHUT_RDWR)
+            #    return
+
+            #raise Exception( "invalid fd: {}".format( fd ) )
 
     def __client_read( self):
         epoll_read_event( self.client_socket, self.mysqld_socket )
@@ -198,22 +225,21 @@ class conn_pair:
     def __client_write( self ):
         raise Exception()
 
-class TCPProxy(threading.Thread):
-    def __init__( self, listen_port, target_addr, target_port ):
-        threading.Thread.__init__(self, daemon=False )
+class MyTCPProxyAbstract( ABC ):
+    @abstractmethod
+    def stop( self ):
+        pass
 
-        self.target_addr = target_addr
-        self.target_port = target_port
-        self.connections = {};
+    @abstractmethod
+    def start( self ):
+        pass
 
-        self.epoll = select.epoll()
-        self.listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.listen_socket.bind(('0.0.0.0', listen_port))
-        self.listen_socket.listen(10)
-        self.listen_socket.setblocking(0)
+##TCPProxy 管理一个epollfd以及一个listenfd，以及在此基础上衍生出来的
+class TCPProxy( MyTCPProxyAbstract):
 
-        self.epoll.register(self.listen_socket.fileno(), select.EPOLLIN | select.EPOLLET)
+    def __init__(self):
+        self.__work_thread_list = None
+        self.__work_t1_stop = True 
 
     def __accept(self):
         try:
@@ -221,7 +247,7 @@ class TCPProxy(threading.Thread):
               connection, address = self.listen_socket.accept()
               connection = MySocket( self.epoll, connection )
               connection.setblocking(0)
-              logger.debug( "accept fd:[{}] remote_addr:[{}] ".format( connection.fileno(),  str( address ) ) )
+              logger.debug( "accept fd:[{}] remote_addr:[{}] ".format( connection.fileno(),  str( address ) ) ) 
 
               #接收到一个连接，立即准备连接到目的端，进行流量转发，此处是转发到mysql
               mysqld_socket = MySocket( self.epoll , socket.socket(socket.AF_INET, socket.SOCK_STREAM) )
@@ -231,15 +257,23 @@ class TCPProxy(threading.Thread):
 
               #使用EPOLLOUT事件来检测连接成功，而不是使用EPOLLIN事件，是为了防止连接成功后，mysqld不发送数据
               conn_pair_obj = conn_pair( connection, mysqld_socket )
-              self.connections[ connection.fileno() ] = self.connections[ mysqld_socket.fileno() ] = conn_pair_obj
 
               try:
-                  mysqld_socket.connect(( self.target_addr, self.target_port ))
+                  mysqld_socket.connect( self.__target_host )
+              except socket.gaierror as e:
+                  logger.error( "parse host[{}] fails. [{}]".format( self.__target_host, e ) )
+                  connection.close()
+                  mysqld_socket.close()
+                  connection = None
+                  mysqld_socket = None
+                  conn_pair_obj = None
+                  return
               except BlockingIOError as e:
                   pass
 
+              self.connections[ connection.fileno() ] = self.connections[ mysqld_socket.fileno() ] = conn_pair_obj
               self.epoll.register(connection.fileno(), MY_EPOLL_FLAGS )
-              self.epoll.register(mysqld_socket.fileno(), select.EPOLLOUT | MY_EPOLL_FLAGS )
+              self.epoll.register(mysqld_socket.fileno(), select.EPOLLOUT | MY_EPOLL_FLAGS ) 
 
         except BlockingIOError as e:
             pass
@@ -250,12 +284,12 @@ class TCPProxy(threading.Thread):
         del self.connections[ fileno ]
         conn_pair_obj.clean( fileno )
 
-    def __error(self,fileno):
+    def __find_conn_pair_with_fd(self, fileno):
         try:
-            conn_pair_obj = self.connections[ fileno ]
-            self.__conn_shutdown( conn_pair_obj, fileno )
+            return self.connections[ fileno ]
         except KeyError as e:
-            logger.warning( "can't find fd:[{}] from connections [{}]".format( fileno, e) )
+            logger.error( "can't find fd:[{}] from connections [{}]".format( fileno, e) )
+            return None
 
     def __event_name(self,event):
         rst = ""
@@ -285,62 +319,108 @@ class TCPProxy(threading.Thread):
         return rst
 
     #当多线程调用epoll_wait，同一个socket的频繁产生的event可能会派生给不同的线程，导致多线程同时操作相同的socket
-    #通过设置 EPOLLONESHOT 来避免上述问题
-    def event_loop( self):
-        while True:
-           events = self.epoll.poll(0)
+    @staticmethod
+    def event_loop( self ):
+        while not self.__work_t1_stop:
+           events = self.epoll.poll( timeout=1 )
            for fileno, event in events:
               logger.debug( "recv fd:{} event: {:#06x} {}".format( fileno, event, self.__event_name(event) ) )
               if fileno == self.listen_socket.fileno():
                  self.__accept()
                  continue
 
+              conn_pair_obj = self.__find_conn_pair_with_fd( fileno )
+
+              if not conn_pair_obj:
+                  continue
+
+              logger.debug( "conn_pair_obj fd[{}] client:[{}] mysql:[{}]".format( \
+                      fileno, \
+                      conn_pair_obj.client_socket.fileno() if conn_pair_obj.client_socket else "None", \
+                      conn_pair_obj.mysqld_socket.fileno() if conn_pair_obj.mysqld_socket else "None") )
+
               #Stream socket peer closed connection, or shut down writing half of connection
               if event & select.EPOLLRDHUP:
                  logger.error( "EPOLLRDHUP:[{}]".format(fileno) )
-                 self.__error(fileno)
+                 self.__conn_shutdown( conn_pair_obj, fileno )
                  continue
 
               if event & select.EPOLLERR:
                  logger.error( "EPOLLERR:[{}]".format(fileno) )
-                 self.__error(fileno)
+                 self.__conn_shutdown( conn_pair_obj, fileno )
                  continue
 
               if event & select.EPOLLHUP:
                  logger.error( "EPOLLHUP:[{}]".format(fileno) )
+                 self.__conn_shutdown( conn_pair_obj, fileno )
+                 continue
 
               if event & select.EPOLLIN:
                  logger.debug( "EPOLLIN:[{}]".format(fileno) )
                  try:
-                     conn_pair_obj = self.connections[ fileno ]
                      conn_pair_obj.epoll_in( fileno )
-                 except KeyError as e:    #直接忽律该错误
-                     logger.warning( "can't find fd:[{}] from connections [{}]".format( fileno, e) )
                  except ConnShutDown:
                      self.__conn_shutdown( conn_pair_obj, fileno )
+                     continue
 
               if event & select.EPOLLOUT:
                  logger.debug( "EPOLLOUT:[{}]".format(fileno) )
                  try:
-                     conn_pair_obj = self.connections[ fileno ]
                      conn_pair_obj.epoll_out( fileno )
-                 except KeyError as e:
-                     logger.warning( "can't find fd:[{}] from connections".format( fileno) )
                  except ConnShutDown:
                      self.__conn_shutdown( conn_pair_obj, fileno )
+                     continue
 
-proxy = TCPProxy(7777, "172.18.10.22", 9999 )
+    def stop( self ):
 
-def worker():
-    try:
-        proxy.event_loop()
-    except Exception as e:
-        traceback.print_exc()
-        logger.critical( "event_loop Exception:{}".format(e) )
-        logging.shutdown()
-        os._exit(1)
+        if self.__work_t1_stop:
+            return
 
-#起开16个线程
-for i in range(16):
-    t1=threading.Thread( target=worker, daemon=False )
-    t1.start()
+        self.__work_t1_stop = True
+
+        for thread_obj in self.__work_thread_list:
+            thread_obj.join()
+        logger.debug( "work_thread all stop, count:[{}]".format(  len( self.__work_thread_list) ) )
+        self.__work_thread_list.clear()
+        self.__work_thread_list = None
+
+        self.listen_socket.close()
+        self.listen_socket = None
+        logger.debug( "listen_socket close" )
+
+        for key, val in self.connections.items():
+            val.clean( key )
+        logger.debug( "connections all clean, count:[{}]".format(  len( self.connections) ) )
+        self.connections.clear()
+
+        self.epoll.close()
+        self.epoll = None
+        logger.debug( "epollfd close" )
+
+    def start( self, listen_port, target_host, work_thread_num ):
+
+        if not self.__work_t1_stop:
+            return
+
+        self.__work_t1_stop = False 
+        self.__target_host = target_host
+
+        self.__work_thread_list=[]
+        self.connections = {};
+
+        self.epoll = select.epoll()
+        ##需要支持多线程响应accept
+        self.listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listen_socket.bind(('0.0.0.0', listen_port))
+        self.listen_socket.listen(10)
+        self.listen_socket.setblocking(0)
+
+        self.epoll.register(self.listen_socket.fileno(), select.EPOLLIN | select.EPOLLET)
+
+        for i in range(work_thread_num):
+            th_obj=threading.Thread( target=self.event_loop, args=(self,))
+            th_obj.start()
+            self.__work_thread_list.append( th_obj )
+
+
