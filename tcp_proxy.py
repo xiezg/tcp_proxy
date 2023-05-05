@@ -11,7 +11,7 @@ import socket, select
 import logging
 import traceback
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
 MYSQL_CONN_PENDING   = 0      #接收到客户端的连接请求并就绪后，连接到mysql的请求连接还未就绪,这时只可以从clinet接收数据，但是不可以向数据库发送数据
 MYSQL_CONN_READY     = 1      #连接到mysqld的连接已就绪，可以在双方进行数据传输
