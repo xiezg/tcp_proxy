@@ -413,12 +413,6 @@ class TCPProxy( MyTCPProxyAbstract):
         if self.__work_t1_stop:
             return
 
-        #关闭listen
-        self.epoll.unregister(self.listen_socket.fileno() )
-        self.listen_socket.close()
-        self.listen_socket = None
-        logger.debug( "listen_socket close" )
-
         #关闭所有的工作线程
         self.__work_t1_stop = True
         for thread_obj in self.__work_thread_list:
@@ -427,8 +421,15 @@ class TCPProxy( MyTCPProxyAbstract):
         self.__work_thread_list.clear()
         self.__work_thread_list = None
 
+        #关闭listen
+        self.epoll.unregister(self.listen_socket.fileno() )
+        self.listen_socket.close()
+        self.listen_socket = None
+        logger.debug( "listen_socket close" )
+
         #关闭所有的TCP会话
-        for fileno , conn_pair_obj in self.connections.items():
+        #字段在遍历过程中，不可以删除元素，因此在复制一个副本，在副本上进行遍历
+        for fileno , conn_pair_obj in dict(self.connections).items():
             self.__conn_shutdown( conn_pair_obj, fileno )
         logger.debug( "connections all clean, count:[{}]".format(  len( self.connections) ) )
         self.connections.clear()
