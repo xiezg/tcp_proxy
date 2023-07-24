@@ -141,7 +141,7 @@ class conn_pair:
         self.__close_lock = threading.Lock()
         self.__ref_count = 2
         self.status = MYSQL_CONN_PENDING    ##没有加锁保护
-        self.reset_active_status()
+        self.__active = True                #初始化为True
         self.__client_socket_fd = client_socket.fileno()
         self.__mysqld_socket_fd = mysqld_socket.fileno()
 
