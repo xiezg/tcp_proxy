@@ -31,7 +31,7 @@ class MyNonBlockSocket:
 
     def shutdown(self, flag):
         try:
-            self.__socket.shutdown( flag )
+            return self.__socket.shutdown( flag )
         except socket.error as e:
             if e.errno == errno.ENOTCONN:   #发生这个异常的原因：1、当对端已经关闭 2、重复调用
                 logger.warning( "fd[{}] shutdown exception:[{}]".format( self.__socket.fileno(), e ) )
@@ -298,7 +298,7 @@ class TCPProxy( MyTCPProxyAbstract):
             pass
 
     #导致关闭的原因包括client端、也包括mysqld端
-    def __conn_shutdown( self, conn_pair_obj,  fileno ):
+    def __conn_shutdown( self, conn_pair_obj, fileno ):
         self.epoll.unregister( fileno )
         del self.connections[ fileno ]
         conn_pair_obj.clean( fileno )
@@ -350,9 +350,13 @@ class TCPProxy( MyTCPProxyAbstract):
                     conn_pair_obj.reset_active_status()
                     continue
 
-                #仅关闭一侧即可，另一侧的关闭由EPOLL通过报错来触发关闭
-                self.__conn_shutdown( conn_pair_obj, conn_pair_obj.client_socket.fileno())
-                logger.debug( "close conn_pair_obj {}".format( conn_pair_obj ) )
+                #TODO 这个线程会与event_loop循环线程产生冲突
+                # 1、某个filefd与epollfd解除绑定后，不能与event_loop线程同步
+                #仅关闭客户端一侧的连接即可，另一侧mysqld的关闭由EPOLL通过报错来触发关闭
+
+                #直接shutdown，会触发epoll的 EPOLLHUP 事件
+                conn_pair_obj.client_socket.shutdown(socket.SHUT_RDWR)
+                logger.debug( "shutdown conn_pair_obj {}".format( conn_pair_obj ) )
 
     #当多线程调用epoll_wait，同一个socket的频繁产生的event可能会派生给不同的线程，导致多线程同时操作相同的socket
     @staticmethod
